@@ -38,13 +38,14 @@ pub fn layout(area: Rect) -> Regions {
     }
 }
 
-/// Content to display: highlighted script source, the bound input's
-/// label + highlighted raw text (or a placeholder if none is bound), and
-/// the last highlighted output/error.
+/// Content to display: highlighted script source, one tab per bound
+/// input (name + highlighted raw text — always at least one entry, a
+/// placeholder if none is bound), which one is active, and the last
+/// highlighted output/error.
 pub struct PlaygroundState {
     pub script_spans: Vec<StyledSpan>,
-    pub input_label: String,
-    pub input_spans: Vec<StyledSpan>,
+    pub inputs: Vec<(String, Vec<StyledSpan>)>,
+    pub active_input: usize,
     pub output_spans: Vec<StyledSpan>,
 }
 
@@ -81,16 +82,44 @@ pub fn spans_to_text(spans: &[StyledSpan]) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Builds the input pane's title as a tab bar: each bound input's name,
+/// with the active one bracketed (e.g. `[payload] headers`). With only
+/// one input bound this just brackets the one name — still correct,
+/// just not visually a "tab bar" until a second input is bound.
+fn input_tabs_title(inputs: &[(String, Vec<StyledSpan>)], active: usize) -> String {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| {
+            if i == active {
+                format!("[{name}]")
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Draws the 3-pane playground into `frame`, bordered and titled, with
-/// each pane's content highlighted per its spans.
+/// each pane's content highlighted per its spans. The input pane shows
+/// only the active tab's content; `Tab`/arrows cycle it (see
+/// `main.rs::run_playground_ticks`).
 pub fn render(frame: &mut Frame, state: &PlaygroundState) {
     let regions = layout(frame.area());
 
+    let active = state.active_input.min(state.inputs.len().saturating_sub(1));
+    let active_spans = state
+        .inputs
+        .get(active)
+        .map(|(_, spans)| spans.as_slice())
+        .unwrap_or(&[]);
+
     frame.render_widget(
-        Paragraph::new(spans_to_text(&state.input_spans)).block(
+        Paragraph::new(spans_to_text(active_spans)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(state.input_label.clone()),
+                .title(input_tabs_title(&state.inputs, active)),
         ),
         regions.input,
     );
@@ -170,8 +199,11 @@ mod tests {
                 "output application/json --- {}",
                 SpanStyle::Plain,
             )],
-            input_label: "payload".to_string(),
-            input_spans: vec![StyledSpan::new(r#"{"a": 1}"#, SpanStyle::Plain)],
+            inputs: vec![(
+                "payload".to_string(),
+                vec![StyledSpan::new(r#"{"a": 1}"#, SpanStyle::Plain)],
+            )],
+            active_input: 0,
             output_spans: vec![StyledSpan::new(r#"{"a": 1}"#, SpanStyle::Plain)],
         }
     }
@@ -195,13 +227,47 @@ mod tests {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = fake_state();
-        state.input_label = "no input bound".to_string();
-        state.input_spans = vec![];
+        state.inputs = vec![("no input bound".to_string(), vec![])];
 
         terminal.draw(|frame| render(frame, &state)).unwrap();
 
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("no input bound"));
+    }
+
+    #[test]
+    fn input_tabs_title_brackets_only_the_active_name() {
+        let inputs = vec![
+            ("payload".to_string(), vec![]),
+            ("headers".to_string(), vec![]),
+        ];
+        assert_eq!(input_tabs_title(&inputs, 0), "[payload] headers");
+        assert_eq!(input_tabs_title(&inputs, 1), "payload [headers]");
+    }
+
+    #[test]
+    fn render_shows_only_the_active_tabs_content() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = fake_state();
+        state.inputs = vec![
+            (
+                "payload".to_string(),
+                vec![StyledSpan::new("PAY", SpanStyle::Plain)],
+            ),
+            (
+                "headers".to_string(),
+                vec![StyledSpan::new("HDR", SpanStyle::Plain)],
+            ),
+        ];
+        state.active_input = 1;
+
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("[headers]"));
+        assert!(content.contains("HDR"));
+        assert!(!content.contains("PAY"));
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {

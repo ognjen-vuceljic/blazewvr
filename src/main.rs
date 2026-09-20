@@ -401,8 +401,11 @@ fn run_history() -> anyhow::Result<()> {
 fn static_playground_state() -> tui::PlaygroundState {
     tui::PlaygroundState {
         script_spans: dwl_highlight::tokenize("%dw 2.0\noutput application/json\n---\n{}"),
-        input_label: "no input bound (use -i data.json to bind `payload`)".to_string(),
-        input_spans: Vec::new(),
+        inputs: vec![(
+            "no input bound (use -i data.json to bind `payload`)".to_string(),
+            Vec::new(),
+        )],
+        active_input: 0,
         output_spans: Vec::new(),
     }
 }
@@ -419,26 +422,32 @@ fn run_playground_static() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The bound input's display label + highlighted spans of its raw file
-/// contents, or a placeholder if none is bound. Only the first bound
-/// input is shown — tabbed multi-input lands in a later Wave 4 PR.
-fn playground_input_display(inputs: &[(String, PathBuf)]) -> (String, Vec<span::StyledSpan>) {
-    match inputs.first() {
-        Some((name, file)) => {
+/// One tab per bound input: its name + highlighted spans of its raw
+/// file contents. Always returns at least one entry — a placeholder
+/// tab if no inputs are bound — so `PlaygroundState.inputs` never needs
+/// to special-case "empty" at render time.
+fn playground_inputs_display(inputs: &[(String, PathBuf)]) -> Vec<(String, Vec<span::StyledSpan>)> {
+    if inputs.is_empty() {
+        return vec![(
+            "no input bound (use -i data.json to bind `payload`)".to_string(),
+            Vec::new(),
+        )];
+    }
+    inputs
+        .iter()
+        .map(|(name, file)| {
             let text = std::fs::read_to_string(file)
                 .unwrap_or_else(|e| format!("error reading {}: {e}", file.display()));
             (name.clone(), colorize::tokenize(&text))
-        }
-        None => (
-            "no input bound (use -i data.json to bind `payload`)".to_string(),
-            Vec::new(),
-        ),
-    }
+        })
+        .collect()
 }
 
 /// Re-reads the script, re-evaluates it against `target`'s bound inputs,
-/// and builds the highlighted `PlaygroundState` to render for this tick.
-/// Pulled out of the render loop (which owns the real terminal/crossterm
+/// and builds the highlighted `PlaygroundState` to render for this tick
+/// (`active_input` is left at 0; `run_playground_ticks` owns which tab
+/// is selected across ticks and overwrites it before drawing). Pulled
+/// out of the render loop (which owns the real terminal/crossterm
 /// input, not itself practical to unit test) so this eval + highlighting
 /// logic is directly testable against a fake `dw`-shaped script.
 fn build_playground_state(
@@ -446,47 +455,60 @@ fn build_playground_state(
     target: &watch::WatchTarget,
 ) -> tui::PlaygroundState {
     let script_src = std::fs::read_to_string(&target.script).unwrap_or_default();
-    let (input_label, input_spans) = playground_input_display(&target.inputs);
+    let inputs = playground_inputs_display(&target.inputs);
     let output_spans = match sup.eval(&flatten::flatten(&script_src)) {
         Ok(text) => colorize::tokenize(&text),
         Err(err) => dwl_highlight::tokenize(&format!("error: {err}")),
     };
     tui::PlaygroundState {
         script_spans: dwl_highlight::tokenize(&script_src),
-        input_label,
-        input_spans,
+        inputs,
+        active_input: 0,
         output_spans,
     }
 }
 
-/// The live-reload loop's branching: quit on `q`/Esc, re-evaluate on a
-/// watched-file change, otherwise keep looping — same 300ms poll cadence
-/// as `watch`. `draw`/`poll_key` are injected (rather than owning a real
-/// terminal/crossterm input directly) so this is testable with fakes;
-/// `run_playground_live_loop` is the thin real-IO adapter around it.
+/// The live-reload loop's branching: quit on `q`/Esc, cycle the active
+/// input tab on `Tab`/`Right`/`l` (forward) or `BackTab`/`Left`/`h`
+/// (back), re-evaluate on a watched-file change, otherwise keep looping
+/// — same 300ms poll cadence as `watch`. `draw`/`poll_key` are injected
+/// (rather than owning a real terminal/crossterm input directly) so
+/// this is testable with fakes; `run_playground_live_loop` is the thin
+/// real-IO adapter around it.
 fn run_playground_ticks(
     sup: &mut repl::Supervisor,
     target: &watch::WatchTarget,
     mut draw: impl FnMut(&tui::PlaygroundState) -> anyhow::Result<()>,
     mut poll_key: impl FnMut(Duration) -> anyhow::Result<Option<crossterm::event::KeyCode>>,
 ) -> anyhow::Result<()> {
+    use crossterm::event::KeyCode;
+
     let paths = watch::watched_paths(target);
     let mut last = watch::mtimes(&paths);
     let mut state = build_playground_state(sup, target);
+    let mut active_input = 0usize;
 
     loop {
+        state.active_input = active_input;
         draw(&state)?;
 
         match poll_key(Duration::from_millis(300))? {
-            Some(crossterm::event::KeyCode::Char('q')) | Some(crossterm::event::KeyCode::Esc) => {
-                return Ok(());
+            Some(KeyCode::Char('q')) | Some(KeyCode::Esc) => return Ok(()),
+            Some(KeyCode::Tab) | Some(KeyCode::Right) | Some(KeyCode::Char('l')) => {
+                active_input = (active_input + 1) % state.inputs.len();
             }
-            Some(_) => continue,
+            Some(KeyCode::BackTab) | Some(KeyCode::Left) | Some(KeyCode::Char('h')) => {
+                active_input = active_input
+                    .checked_sub(1)
+                    .unwrap_or(state.inputs.len() - 1);
+            }
+            Some(_) => {}
             None => {
                 let current = watch::mtimes(&paths);
                 if current != last {
                     last = current;
                     state = build_playground_state(sup, target);
+                    active_input = active_input.min(state.inputs.len() - 1);
                 }
             }
         }
@@ -1044,34 +1066,46 @@ mod tests {
     fn static_playground_state_shows_a_placeholder_dwl_script_and_no_input() {
         let state = static_playground_state();
         assert!(spans_text(&state.script_spans).contains("%dw 2.0"));
-        assert!(state.input_label.contains("no input bound"));
-        assert!(state.input_spans.is_empty());
+        assert_eq!(state.inputs.len(), 1);
+        assert!(state.inputs[0].0.contains("no input bound"));
+        assert!(state.inputs[0].1.is_empty());
         assert!(state.output_spans.is_empty());
     }
 
     #[test]
-    fn playground_input_display_shows_placeholder_when_no_inputs_bound() {
-        let (label, spans) = playground_input_display(&[]);
-        assert!(label.contains("no input bound"));
-        assert!(spans.is_empty());
+    fn playground_inputs_display_shows_a_single_placeholder_tab_when_none_bound() {
+        let tabs = playground_inputs_display(&[]);
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs[0].0.contains("no input bound"));
+        assert!(tabs[0].1.is_empty());
     }
 
     #[test]
-    fn playground_input_display_reads_and_labels_the_first_bound_input() {
+    fn playground_inputs_display_reads_and_labels_each_bound_input() {
         let dir = test_dir();
-        let file = dir.join("payload.json");
-        fs::write(&file, r#"{"a": 1}"#).unwrap();
-        let (label, spans) = playground_input_display(&[("payload".to_string(), file)]);
-        assert_eq!(label, "payload");
-        assert_eq!(spans_text(&spans), r#"{"a": 1}"#);
+        let payload = dir.join("payload.json");
+        fs::write(&payload, r#"{"a": 1}"#).unwrap();
+        let headers = dir.join("headers.json");
+        fs::write(&headers, r#"{"b": 2}"#).unwrap();
+
+        let tabs = playground_inputs_display(&[
+            ("payload".to_string(), payload),
+            ("headers".to_string(), headers),
+        ]);
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].0, "payload");
+        assert_eq!(spans_text(&tabs[0].1), r#"{"a": 1}"#);
+        assert_eq!(tabs[1].0, "headers");
+        assert_eq!(spans_text(&tabs[1].1), r#"{"b": 2}"#);
     }
 
     #[test]
-    fn playground_input_display_reports_a_read_error_inline() {
+    fn playground_inputs_display_reports_a_read_error_inline() {
         let missing = test_dir().join("missing.json");
-        let (label, spans) = playground_input_display(&[("payload".to_string(), missing)]);
-        assert_eq!(label, "payload");
-        assert!(spans_text(&spans).contains("error reading"));
+        let tabs = playground_inputs_display(&[("payload".to_string(), missing)]);
+        assert_eq!(tabs[0].0, "payload");
+        assert!(spans_text(&tabs[0].1).contains("error reading"));
     }
 
     #[test]
@@ -1089,7 +1123,7 @@ mod tests {
 
         assert_eq!(spans_text(&state.script_spans), "hello");
         assert!(spans_text(&state.output_spans).contains("ECHO:hello"));
-        assert!(state.input_label.contains("no input bound"));
+        assert!(state.inputs[0].0.contains("no input bound"));
     }
 
     #[test]
@@ -1233,5 +1267,81 @@ mod tests {
 
         assert!(outputs[0].contains("ECHO:one"));
         assert!(outputs.last().unwrap().contains("ECHO:two"));
+    }
+
+    #[test]
+    fn run_playground_ticks_cycles_active_input_forward_and_wraps() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let a = dir.join("a.json");
+        fs::write(&a, "a").unwrap();
+        let b = dir.join("b.json");
+        fs::write(&b, "b").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![("a".to_string(), a), ("b".to_string(), b)],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let mut active_seen: Vec<usize> = Vec::new();
+        let mut calls = 0;
+        run_playground_ticks(
+            &mut sup,
+            &target,
+            |state| {
+                active_seen.push(state.active_input);
+                Ok(())
+            },
+            |_timeout| {
+                calls += 1;
+                match calls {
+                    1 | 2 => Ok(Some(crossterm::event::KeyCode::Tab)),
+                    _ => Ok(Some(crossterm::event::KeyCode::Char('q'))),
+                }
+            },
+        )
+        .unwrap();
+
+        // starts at 0, Tab -> 1, Tab -> wraps back to 0
+        assert_eq!(active_seen, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn run_playground_ticks_cycles_active_input_backward_and_wraps() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let a = dir.join("a.json");
+        fs::write(&a, "a").unwrap();
+        let b = dir.join("b.json");
+        fs::write(&b, "b").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![("a".to_string(), a), ("b".to_string(), b)],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let mut active_seen: Vec<usize> = Vec::new();
+        let mut calls = 0;
+        run_playground_ticks(
+            &mut sup,
+            &target,
+            |state| {
+                active_seen.push(state.active_input);
+                Ok(())
+            },
+            |_timeout| {
+                calls += 1;
+                match calls {
+                    1 => Ok(Some(crossterm::event::KeyCode::BackTab)),
+                    _ => Ok(Some(crossterm::event::KeyCode::Char('q'))),
+                }
+            },
+        )
+        .unwrap();
+
+        // starts at 0, Shift+Tab wraps back to the last tab
+        assert_eq!(active_seen, vec![0, 1]);
     }
 }
