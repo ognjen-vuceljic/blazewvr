@@ -9,11 +9,6 @@
 //! directive decides it, so a config field for that would have no
 //! engine mechanism behind it. Add it if/when `dw` actually grows one.
 
-// ponytail: not yet wired into a command (lands with Wave 2 CLI wiring);
-// allowed dead here so this PR can ship config loading standalone with
-// full test coverage.
-#![allow(dead_code)]
-
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;

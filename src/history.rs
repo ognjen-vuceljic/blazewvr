@@ -1,11 +1,6 @@
 //! Records each `blazewvr watch` invocation to a small local history
 //! file, and lets the user fuzzy-recall + re-run a past one via `fzf`.
 
-// ponytail: not yet wired into a command (lands with Wave 3 CLI wiring);
-// allowed dead here so this PR can ship history recording/recall
-// standalone with full test coverage.
-#![allow(dead_code)]
-
 use crate::picker::{self, PickerConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;

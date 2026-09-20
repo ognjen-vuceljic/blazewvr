@@ -3,7 +3,7 @@
 //! re-evaluates on change, printing a status header + colorized result.
 
 use crate::repl::Supervisor;
-use crate::{colorize, flatten, status};
+use crate::{colorize, dwl_highlight, flatten, status};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -41,6 +41,12 @@ fn mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
 
 /// Reads, flattens, and evaluates the script once, returning the header +
 /// colorized result (or error) as the text to print.
+///
+/// Successful output (JSON/XML/CSV-shaped) uses the generic structural
+/// colorizer; error text uses the DataWeave-aware highlighter instead,
+/// since `dw` echoes a snippet of the offending DWL source inside its
+/// error messages (e.g. `5| payload.items filter (...)`) — that reads as
+/// code, not as generic structured data.
 pub fn eval_once(sup: &mut Supervisor, target: &WatchTarget) -> String {
     let start = Instant::now();
     let outcome = fs::read_to_string(&target.script)
@@ -51,7 +57,10 @@ pub fn eval_once(sup: &mut Supervisor, target: &WatchTarget) -> String {
 
     match outcome {
         Ok(text) => format!("{header}\n{}", colorize::colorize(&text)),
-        Err(err) => format!("{header}\n{}", colorize::colorize(&format!("error: {err}"))),
+        Err(err) => format!(
+            "{header}\n{}",
+            dwl_highlight::highlight(&format!("error: {err}"))
+        ),
     }
 }
 
