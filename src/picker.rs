@@ -38,19 +38,28 @@ impl Default for PickerConfig {
     }
 }
 
-/// True if `program` can be executed at all (used to check `fzf` is on
-/// `PATH` before relying on it).
+/// How many times a transient spawn failure (see `spawn_retrying`) is
+/// retried before giving up, and how long to wait between attempts.
 ///
-/// Retries once on failure. Observed twice in real CI runs (not
-/// reproducible locally, in either build): a freshly-written,
-/// freshly-chmod'd script spawned via this exact call spuriously failed
-/// to execute, while every other spawn (including the same script, via
-/// `pick`/`pick_multi`, moments later in the same test) succeeded. A
-/// single retry is cheap — this only runs once per command invocation —
-/// and turns a transient spawn hiccup into a non-issue rather than a
-/// wrongly-reported "fzf not found".
+/// Two immediate, back-to-back attempts (the original mitigation) turned
+/// out not to be enough: real CI runs hit `ExecutableFileBusy` on *both*
+/// attempts, on more than one test, in the same run (2026-09-20, PR #38).
+/// An immediate retry doesn't actually wait for whatever transient
+/// condition (page-cache writeback lag, a security scanner briefly
+/// holding the file open — never reproduced locally to confirm which)
+/// caused the busy state to clear. A short sleep between attempts gives
+/// it a chance to.
+const SPAWN_RETRY_ATTEMPTS: u32 = 4;
+const SPAWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// True if `program` can be executed at all (used to check `fzf` is on
+/// `PATH` before relying on it). See `SPAWN_RETRY_ATTEMPTS`'s doc comment
+/// for why this retries with a delay rather than just once.
 pub fn is_available(program: &Path) -> bool {
-    for _ in 0..2 {
+    for attempt in 0..SPAWN_RETRY_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(SPAWN_RETRY_DELAY);
+        }
         let ok = Command::new(program)
             .arg("--version")
             .stdout(Stdio::null())
@@ -64,18 +73,28 @@ pub fn is_available(program: &Path) -> bool {
     false
 }
 
-/// Runs `attempt`, retrying once on failure.
+/// Runs `attempt`, retrying (with a short delay between attempts — see
+/// `SPAWN_RETRY_ATTEMPTS`'s doc comment) on failure.
 ///
 /// The same transient-spawn-failure class documented on `is_available`
-/// above (a freshly-written, freshly-chmod'd script spuriously failing to
-/// execute) was observed hitting the *actual* picker spawn too — i.e. a
+/// above was observed hitting the *actual* picker spawn too — i.e. a
 /// real `pick`/`pick_multi`/`pick_history` call, not just the
 /// `is_available` probe that precedes it. Retrying there didn't help,
 /// since the failure showed up moments later in this separate spawn.
 /// Takes a closure rather than `&mut Command` directly so the retry
 /// itself is testable with a deterministic fail-then-succeed stub.
 fn spawn_retrying(mut attempt: impl FnMut() -> io::Result<Child>) -> io::Result<Child> {
-    attempt().or_else(|_| attempt())
+    let mut last_err = None;
+    for i in 0..SPAWN_RETRY_ATTEMPTS {
+        if i > 0 {
+            std::thread::sleep(SPAWN_RETRY_DELAY);
+        }
+        match attempt() {
+            Ok(child) => return Ok(child),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.expect("SPAWN_RETRY_ATTEMPTS > 0, so at least one attempt ran"))
 }
 
 /// Spawns the picker with `extra_flags` appended before `config`'s own
@@ -349,32 +368,33 @@ mod tests {
     }
 
     #[test]
-    fn spawn_retrying_propagates_error_when_both_attempts_fail() {
+    fn spawn_retrying_propagates_error_when_all_attempts_fail() {
         let mut attempts = 0;
         let result = spawn_retrying(|| {
             attempts += 1;
             Command::new("/nonexistent/blazewvr/nope").spawn()
         });
         assert!(result.is_err());
-        assert_eq!(attempts, 2);
+        assert_eq!(attempts, SPAWN_RETRY_ATTEMPTS);
     }
 
     #[test]
-    fn spawn_retrying_succeeds_on_second_attempt_after_a_transient_failure() {
-        // Reproduces the observed CI failure shape: the first spawn of a
-        // given command fails, but the exact same command succeeds
-        // moments later.
+    fn spawn_retrying_succeeds_after_repeated_transient_failures() {
+        // Reproduces the observed CI failure shape: a given command fails
+        // to spawn a few times in a row, but the exact same command
+        // succeeds moments later — including the two-failures-in-a-row
+        // case that a plain single retry wasn't enough to cover.
         let mut attempts = 0;
         let result = spawn_retrying(|| {
             attempts += 1;
-            if attempts == 1 {
+            if attempts <= 2 {
                 Err(io::Error::other("transient spawn failure"))
             } else {
                 Command::new(fake_fzf_script()).spawn()
             }
         });
         assert!(result.is_ok());
-        assert_eq!(attempts, 2);
+        assert_eq!(attempts, 3);
     }
 
     /// Fake fzf: reads candidates from stdin, prints the ones matching a

@@ -1,0 +1,4 @@
+module_path = "libs"
+
+[inputs]
+payload = "orders.payload.json"
