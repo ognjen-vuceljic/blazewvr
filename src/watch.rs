@@ -14,13 +14,24 @@ pub struct WatchTarget {
     pub inputs: Vec<(String, PathBuf)>,
 }
 
-/// Parses a `-i name=file` argument into `(name, file)`.
+/// Parses a `-i` argument into `(name, file)`. Accepts either an explicit
+/// `name=file`, or a bare file path, which defaults to the name `payload`
+/// — matching the DataWeave Playground convention where `payload` is the
+/// default variable for the incoming input, so `-i data.json` behaves the
+/// way a Playground user would already expect without needing to know
+/// (or type) the `payload=` prefix.
 pub fn parse_input(s: &str) -> Result<(String, PathBuf), String> {
     match s.split_once('=') {
         Some((name, file)) if !name.is_empty() && !file.is_empty() => {
             Ok((name.to_string(), PathBuf::from(file)))
         }
-        _ => Err(format!("invalid input '{s}', expected name=file")),
+        Some(_) => Err(format!(
+            "invalid input '{s}', expected name=file or a bare file path"
+        )),
+        None if !s.is_empty() => Ok(("payload".to_string(), PathBuf::from(s))),
+        None => Err(format!(
+            "invalid input '{s}', expected name=file or a bare file path"
+        )),
     }
 }
 
@@ -128,8 +139,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_input_rejects_missing_equals() {
-        assert!(parse_input("payload").is_err());
+    fn parse_input_defaults_bare_path_to_payload() {
+        assert_eq!(
+            parse_input("data.json"),
+            Ok(("payload".to_string(), PathBuf::from("data.json")))
+        );
+    }
+
+    #[test]
+    fn parse_input_rejects_empty_string() {
+        assert!(parse_input("").is_err());
     }
 
     #[test]

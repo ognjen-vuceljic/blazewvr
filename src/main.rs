@@ -37,6 +37,10 @@ enum Commands {
     },
     /// Interactive read-eval-print loop
     Repl {
+        /// Bind an input for expressions to reference, e.g. -i data.json
+        /// (defaults to `payload`) or -i name=file for another name
+        #[arg(short, long)]
+        input: Vec<String>,
         /// Module resolution path(s), e.g. --path=dir1:dir2
         #[arg(long)]
         path: Option<String>,
@@ -159,14 +163,31 @@ fn repl_eval_line(sup: &mut repl::Supervisor, line: &str) -> String {
 /// and its result is printed immediately — unlike `run` (one script,
 /// one output, exits) or `watch` (re-evaluates a file on save), this is
 /// driven by the user typing at the prompt, one expression at a time.
-fn run_repl(path: Option<String>) -> anyhow::Result<()> {
-    let mut config = repl::ReplConfig::for_dw(Path::new("dw"), &[]);
+fn run_repl(input: Vec<String>, path: Option<String>) -> anyhow::Result<()> {
+    let inputs: Vec<(String, PathBuf)> = input
+        .iter()
+        .map(|s| watch::parse_input(s))
+        .collect::<Result<_, _>>()
+        .map_err(anyhow::Error::msg)?;
+
+    let mut config = repl::ReplConfig::for_dw(Path::new("dw"), &inputs);
     if let Some(p) = &path {
         config = config.with_module_path(p);
     }
     let mut sup = repl::Supervisor::new(config);
 
-    println!("blazewvr REPL — type a DataWeave expression, Ctrl+D to exit");
+    if inputs.is_empty() {
+        println!(
+            "blazewvr REPL — no inputs bound (use -i data.json to bind `payload`), type a DataWeave expression, Ctrl+D to exit"
+        );
+    } else {
+        let bound = inputs
+            .iter()
+            .map(|(name, file)| format!("{name}={}", file.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("blazewvr REPL — inputs: {bound} — type a DataWeave expression, Ctrl+D to exit");
+    }
     let stdin = std::io::stdin();
     loop {
         print!("dw> ");
@@ -372,7 +393,7 @@ fn main() -> anyhow::Result<()> {
             input,
             path,
         } => run_run(script, input, path),
-        Commands::Repl { path } => run_repl(path),
+        Commands::Repl { input, path } => run_repl(input, path),
         Commands::Watch {
             script,
             input,
@@ -568,7 +589,7 @@ mod tests {
         let result = prepare_watch(
             &dir,
             Some("s.dwl".into()),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
             false,
             &picker_config,
@@ -649,7 +670,7 @@ mod tests {
         let result = prepare_run(
             &dir,
             &script.display().to_string(),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
         );
         assert!(result.is_err());
@@ -734,7 +755,7 @@ mod tests {
     fn run_watch_rejects_invalid_input_format() {
         let result = run_watch(
             Some("script.dwl".into()),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
             false,
         );
@@ -775,6 +796,23 @@ mod tests {
     fn cli_parses_history_subcommand() {
         let cli = Cli::parse_from(["blazewvr", "history"]);
         assert!(matches!(cli.command, Commands::History));
+    }
+
+    #[test]
+    fn cli_parses_repl_input_flag() {
+        let cli = Cli::parse_from(["blazewvr", "repl", "-i", "payload=data.json"]);
+        match cli.command {
+            Commands::Repl { input, .. } => {
+                assert_eq!(input, vec!["payload=data.json".to_string()])
+            }
+            _ => panic!("expected Repl"),
+        }
+    }
+
+    #[test]
+    fn run_repl_rejects_invalid_input_format() {
+        let result = run_repl(vec!["=bad-input".into()], None);
+        assert!(result.is_err());
     }
 
     #[test]
