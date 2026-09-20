@@ -13,6 +13,7 @@ mod picker;
 mod repl;
 mod run_once;
 mod sidecar;
+mod span;
 mod status;
 mod watch;
 
