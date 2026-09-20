@@ -23,7 +23,7 @@ mod watch;
 #[command(name = "blazewvr", version)]
 struct Cli {
     /// Script to open in the TUI playground (bare invocation only; omit
-    /// to open with a placeholder until one is picked)
+    /// to fuzzy-pick one via fzf)
     script: Option<String>,
     #[arg(short, long)]
     input: Vec<String>,
@@ -396,30 +396,20 @@ fn run_history() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The placeholder content shown until a script is picked (bare
-/// `blazewvr`, no script, no subcommand).
-fn static_playground_state() -> tui::PlaygroundState {
-    tui::PlaygroundState {
-        script_spans: dwl_highlight::tokenize("%dw 2.0\noutput application/json\n---\n{}"),
-        inputs: vec![(
-            "no input bound (use -i data.json to bind `payload`)".to_string(),
-            Vec::new(),
-        )],
-        active_input: 0,
-        output_spans: Vec::new(),
+/// Resolves the script bare `blazewvr` should open: the one given
+/// explicitly, or — reusing the same fuzzy-picker `watch` falls back to
+/// when given no script — one picked via `fzf`. `Ok(None)` means the
+/// user backed out of the picker with nothing selected, which is not an
+/// error (there's simply nothing to open).
+fn resolve_playground_script(
+    cwd: &Path,
+    script: Option<String>,
+    picker_config: &picker::PickerConfig,
+) -> anyhow::Result<Option<String>> {
+    match script {
+        Some(s) => Ok(Some(s)),
+        None => Ok(picker::pick_script(picker_config, cwd)?.map(|p| p.display().to_string())),
     }
-}
-
-/// Renders the static placeholder once and exits on any keypress.
-/// Picker integration lands in a later Wave 4 PR (issue #6) — for now
-/// this is the only bare-with-no-script behavior.
-fn run_playground_static() -> anyhow::Result<()> {
-    let mut terminal = ratatui::try_init()?;
-    let state = static_playground_state();
-    terminal.draw(|frame| tui::render(frame, &state))?;
-    crossterm::event::read()?;
-    ratatui::restore();
-    Ok(())
 }
 
 /// One tab per bound input: its name + highlighted spans of its raw
@@ -540,14 +530,22 @@ fn run_playground_live_loop(
     )
 }
 
-/// Bare `blazewvr script.dwl`: opens the TUI playground live-reloading
-/// that script, same input resolution (CLI > sidecar > config) as `run`.
-fn run_playground_live(
-    script: String,
+/// Bare `blazewvr` (with or without a script): resolves the script to
+/// open (explicit, or fuzzy-picked via `fzf` — see
+/// `resolve_playground_script`), then opens the TUI playground
+/// live-reloading it, same input resolution (CLI > sidecar > config) as
+/// `run`. Does nothing if the picker was shown and nothing was
+/// selected.
+fn run_playground(
+    script: Option<String>,
     input: Vec<String>,
     path: Option<String>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
+    let Some(script) = resolve_playground_script(&cwd, script, &picker::PickerConfig::default())?
+    else {
+        return Ok(());
+    };
     let plan = prepare_run(&cwd, &script, input, path)?;
     let target = watch::WatchTarget {
         script: PathBuf::from(&script),
@@ -564,10 +562,7 @@ fn run_playground_live(
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => match cli.script {
-            Some(script) => run_playground_live(script, cli.input, cli.path),
-            None => run_playground_static(),
-        },
+        None => run_playground(cli.script, cli.input, cli.path),
         Some(Commands::Run {
             script,
             input,
@@ -1063,13 +1058,49 @@ mod tests {
     }
 
     #[test]
-    fn static_playground_state_shows_a_placeholder_dwl_script_and_no_input() {
-        let state = static_playground_state();
-        assert!(spans_text(&state.script_spans).contains("%dw 2.0"));
-        assert_eq!(state.inputs.len(), 1);
-        assert!(state.inputs[0].0.contains("no input bound"));
-        assert!(state.inputs[0].1.is_empty());
-        assert!(state.output_spans.is_empty());
+    fn resolve_playground_script_uses_the_explicit_script_without_picking() {
+        let dir = test_dir();
+        let picker_config = picker::PickerConfig {
+            program: PathBuf::from("/nonexistent/blazewvr/nope"),
+            ..Default::default()
+        };
+        let resolved =
+            resolve_playground_script(&dir, Some("s.dwl".into()), &picker_config).unwrap();
+        assert_eq!(resolved, Some("s.dwl".to_string()));
+    }
+
+    #[test]
+    fn resolve_playground_script_picks_via_fzf_when_none_given() {
+        let dir = test_dir();
+        fs::write(dir.join("a.dwl"), "x").unwrap();
+        let picker_config = picker::PickerConfig {
+            program: fake_fzf_script(),
+            ..Default::default()
+        };
+        let resolved = resolve_playground_script(&dir, None, &picker_config).unwrap();
+        assert_eq!(resolved, Some(dir.join("a.dwl").display().to_string()));
+    }
+
+    #[test]
+    fn resolve_playground_script_is_none_when_nothing_was_picked() {
+        let dir = test_dir(); // empty: no .dwl candidates to select from
+        let picker_config = picker::PickerConfig {
+            program: fake_fzf_script(),
+            ..Default::default()
+        };
+        let resolved = resolve_playground_script(&dir, None, &picker_config).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_playground_script_errs_when_fzf_unavailable() {
+        let dir = test_dir();
+        let picker_config = picker::PickerConfig {
+            program: PathBuf::from("/nonexistent/blazewvr/nope"),
+            ..Default::default()
+        };
+        let result = resolve_playground_script(&dir, None, &picker_config);
+        assert!(result.is_err());
     }
 
     #[test]
