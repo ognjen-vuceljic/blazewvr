@@ -16,12 +16,18 @@ use std::process::{Command, Stdio};
 /// Which picker binary to invoke.
 pub struct PickerConfig {
     pub program: PathBuf,
+    /// Extra args appended to every invocation. Empty for real `fzf`
+    /// usage; tests use this to make the fake picker script deterministic
+    /// without resorting to process-global env vars (which would race
+    /// under parallel test execution).
+    pub extra_args: Vec<String>,
 }
 
 impl Default for PickerConfig {
     fn default() -> Self {
         Self {
             program: PathBuf::from("fzf"),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -37,8 +43,9 @@ pub fn is_available(program: &Path) -> bool {
         .is_ok()
 }
 
-/// Pipes `candidates` into the picker and returns the selected line, or
-/// `None` if nothing was selected (empty list, or the user backed out).
+/// Spawns the picker with `extra_flags` appended after `config`'s own
+/// `extra_args`, feeds it `candidates` on stdin, and returns its raw
+/// stdout text.
 ///
 /// Writes to the child's stdin on a separate thread while reading its
 /// stdout on this one. Writing and reading sequentially on one thread
@@ -48,12 +55,14 @@ pub fn is_available(program: &Path) -> bool {
 /// pipe from the writer (the picker selecting and exiting before it has
 /// consumed all input — the common case, not an edge case) is not
 /// treated as an error.
-pub fn pick(config: &PickerConfig, candidates: &[String]) -> io::Result<Option<String>> {
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-
+fn run_picker(
+    config: &PickerConfig,
+    extra_flags: &[&str],
+    candidates: &[String],
+) -> io::Result<String> {
     let mut child = Command::new(&config.program)
+        .args(extra_flags)
+        .args(&config.extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -68,8 +77,16 @@ pub fn pick(config: &PickerConfig, candidates: &[String]) -> io::Result<Option<S
 
     let output = child.wait_with_output()?;
     let _ = writer.join();
-    let selection = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
 
+/// Pipes `candidates` into the picker and returns the selected line, or
+/// `None` if nothing was selected (empty list, or the user backed out).
+pub fn pick(config: &PickerConfig, candidates: &[String]) -> io::Result<Option<String>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let selection = run_picker(config, &[], candidates)?.trim().to_string();
     if selection.is_empty() {
         Ok(None)
     } else {
@@ -77,20 +94,58 @@ pub fn pick(config: &PickerConfig, candidates: &[String]) -> io::Result<Option<S
     }
 }
 
-/// Recursively finds `.dwl` files under `root`, skipping hidden
-/// directories, `target/`, and symlinks (both to avoid following a
+/// Like `pick`, but allows selecting multiple candidates (`fzf -m`),
+/// returning each selected line in order.
+pub fn pick_multi(config: &PickerConfig, candidates: &[String]) -> io::Result<Vec<String>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = run_picker(config, &["-m"], candidates)?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+const DATA_EXTENSIONS: &[&str] = &["json", "xml", "csv", "yaml", "yml", "txt"];
+
+/// Recursively finds `.dwl` files under `root`. See `find_files` for the
+/// shared traversal rules (symlinks, hidden dirs, `target/`, unreadable
+/// dirs).
+pub fn find_dwl_scripts(root: &Path) -> Vec<PathBuf> {
+    find_files(root, |p| {
+        p.extension().and_then(|e| e.to_str()) == Some("dwl")
+    })
+}
+
+/// Recursively finds likely data files (json/xml/csv/yaml/txt) under
+/// `root`, excluding `exclude` (typically the script being run — it
+/// wouldn't make sense to bind it as its own input).
+pub fn find_data_files(root: &Path, exclude: &Path) -> Vec<PathBuf> {
+    find_files(root, |p| {
+        p != exclude
+            && p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| DATA_EXTENSIONS.contains(&ext))
+    })
+}
+
+/// Recursively finds files under `root` matching `matches`, skipping
+/// hidden directories, `target/`, and symlinks (both to avoid following a
 /// symlink cycle into unbounded recursion, and because resolving them
 /// correctly is more than this needs). Directories that can't be read
 /// are skipped with a warning on stderr rather than silently, so a
 /// truncated result isn't mistaken for a genuinely empty one.
-pub fn find_dwl_scripts(root: &Path) -> Vec<PathBuf> {
+fn find_files(root: &Path, matches: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    walk(root, &mut results);
+    walk(root, &mut results, &matches);
     results.sort();
     results
 }
 
-fn walk(dir: &Path, results: &mut Vec<PathBuf>) {
+fn walk(dir: &Path, results: &mut Vec<PathBuf>, matches: &impl Fn(&Path) -> bool) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -113,8 +168,8 @@ fn walk(dir: &Path, results: &mut Vec<PathBuf>) {
             if name_str == "target" {
                 continue;
             }
-            walk(&path, results);
-        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("dwl") {
+            walk(&path, results, matches);
+        } else if file_type.is_file() && matches(&path) {
             results.push(path);
         }
     }
@@ -152,6 +207,57 @@ pub fn pick_script(config: &PickerConfig, root: &Path) -> io::Result<Option<Path
     }
 }
 
+/// Fuzzy-multi-picks data files under `root` (excluding `script`) and
+/// binds each selected file to an input name, via `name_for` — called
+/// once per selected file with that file's stem as a default, returning
+/// the name to bind it as (an empty/whitespace-only response falls back
+/// to the default). Injectable so the real "prompt the user on stdin"
+/// behavior and the fully-scripted test behavior share this same
+/// resolution logic.
+pub fn bind_inputs_via_picker(
+    config: &PickerConfig,
+    script: &Path,
+    root: &Path,
+    mut name_for: impl FnMut(&str) -> io::Result<String>,
+) -> io::Result<Vec<(String, PathBuf)>> {
+    if !is_available(&config.program) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} not found on PATH; use -i/sidecar/config inputs instead",
+                config.program.display()
+            ),
+        ));
+    }
+
+    let candidates = find_data_files(root, script);
+    let candidate_strs: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+    let selected = pick_multi(config, &candidate_strs)?;
+
+    let mut bound = Vec::new();
+    for selection in selected {
+        let Some(path) = candidates
+            .iter()
+            .find(|p| p.display().to_string() == selection)
+        else {
+            continue;
+        };
+        let default_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("input")
+            .to_string();
+        let name = name_for(&default_name)?;
+        let name = if name.trim().is_empty() {
+            default_name
+        } else {
+            name.trim().to_string()
+        };
+        bound.push((name, path.clone()));
+    }
+    Ok(bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,19 +273,25 @@ mod tests {
         dir
     }
 
-    /// Fake fzf: reads candidates from stdin, prints the one matching
-    /// $FAKE_PICK (or the first line if unset) to stdout.
+    /// Fake fzf: reads candidates from stdin, prints the ones matching a
+    /// `--select=<substring>` arg (grep, so possibly more than one line —
+    /// good enough to simulate multi-select), or just the first line if
+    /// no `--select` was given. `--select` is argv-based (not an env var)
+    /// specifically so it's per-Command and safe under parallel tests.
     fn fake_fzf_script() -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path =
             std::env::temp_dir().join(format!("blazewvr_fake_fzf_{}_{id}.sh", std::process::id()));
         let script = r#"#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "fake-fzf 0.0.0"
-  exit 0
-fi
-if [ -n "$FAKE_PICK" ]; then
-  grep -F "$FAKE_PICK"
+select=""
+for arg in "$@"; do
+  case "$arg" in
+    --version) echo "fake-fzf 0.0.0"; exit 0 ;;
+    --select=*) select="${arg#--select=}" ;;
+  esac
+done
+if [ -n "$select" ]; then
+  grep -F "$select"
 else
   head -n1
 fi
@@ -203,6 +315,7 @@ fi
     fn pick_returns_none_for_empty_candidates() {
         let config = PickerConfig {
             program: fake_fzf_script(),
+            ..Default::default()
         };
         assert_eq!(pick(&config, &[]).unwrap(), None);
     }
@@ -211,6 +324,7 @@ fi
     fn pick_returns_first_candidate_by_default() {
         let config = PickerConfig {
             program: fake_fzf_script(),
+            ..Default::default()
         };
         let candidates = vec!["a.dwl".to_string(), "b.dwl".to_string()];
         assert_eq!(
@@ -239,6 +353,7 @@ fi
     fn pick_script_errs_when_fzf_unavailable() {
         let config = PickerConfig {
             program: PathBuf::from("/nonexistent/blazewvr/nope"),
+            ..Default::default()
         };
         let dir = test_dir();
         let result = pick_script(&config, &dir);
@@ -249,6 +364,7 @@ fi
     fn pick_script_returns_none_when_no_scripts_found() {
         let config = PickerConfig {
             program: fake_fzf_script(),
+            ..Default::default()
         };
         let dir = test_dir();
         assert_eq!(pick_script(&config, &dir).unwrap(), None);
@@ -258,6 +374,7 @@ fi
     fn pick_script_returns_selected_path() {
         let config = PickerConfig {
             program: fake_fzf_script(),
+            ..Default::default()
         };
         let dir = test_dir();
         fs::write(dir.join("only.dwl"), "x").unwrap();
@@ -325,6 +442,7 @@ fi
 
         let config = PickerConfig {
             program: fake_fzf_script(),
+            ..Default::default()
         };
         let result = pick_script(&config, &dir).unwrap();
         assert_eq!(result, Some(dir.join(name)));
@@ -339,6 +457,7 @@ fi
         // pipe from the early exit must also not surface as an Err.
         let config = PickerConfig {
             program: PathBuf::from("head"),
+            ..Default::default()
         };
         let candidates: Vec<String> = (0..5000)
             .map(|i| format!("candidate-{i}-{}", "x".repeat(100)))
@@ -346,5 +465,140 @@ fi
 
         let result = pick(&config, &candidates);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn pick_multi_returns_empty_for_empty_candidates() {
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            ..Default::default()
+        };
+        assert_eq!(pick_multi(&config, &[]).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pick_multi_returns_multiple_matching_selections() {
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            extra_args: vec!["--select=data".to_string()],
+        };
+        let candidates = vec![
+            "a.data.json".to_string(),
+            "b.data.xml".to_string(),
+            "c.other.txt".to_string(),
+        ];
+        let result = pick_multi(&config, &candidates).unwrap();
+        assert_eq!(
+            result,
+            vec!["a.data.json".to_string(), "b.data.xml".to_string()]
+        );
+    }
+
+    #[test]
+    fn find_data_files_matches_known_extensions_and_excludes_given_path() {
+        let dir = test_dir();
+        let script = dir.join("script.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::write(dir.join("payload.json"), "{}").unwrap();
+        fs::write(dir.join("headers.xml"), "<a/>").unwrap();
+        fs::write(dir.join("notes.md"), "hi").unwrap();
+        // A .json file that happens to equal `script`'s own extension
+        // pattern isn't special-cased — only exact path equality excludes.
+        fs::write(dir.join("other.dwl"), "y").unwrap();
+
+        let found = find_data_files(&dir, &script);
+        assert_eq!(
+            found,
+            vec![dir.join("headers.xml"), dir.join("payload.json")]
+        );
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_errs_when_fzf_unavailable() {
+        let config = PickerConfig {
+            program: PathBuf::from("/nonexistent/blazewvr/nope"),
+            ..Default::default()
+        };
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        let result =
+            bind_inputs_via_picker(&config, &script, &dir, |default| Ok(default.to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_binds_selected_files_with_default_names() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::write(dir.join("payload.json"), "{}").unwrap();
+
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            extra_args: vec!["--select=payload".to_string()],
+        };
+        let result =
+            bind_inputs_via_picker(&config, &script, &dir, |default| Ok(default.to_string()))
+                .unwrap();
+        assert_eq!(
+            result,
+            vec![("payload".to_string(), dir.join("payload.json"))]
+        );
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_uses_custom_name_over_default() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::write(dir.join("payload.json"), "{}").unwrap();
+
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            extra_args: vec!["--select=payload".to_string()],
+        };
+        let result =
+            bind_inputs_via_picker(&config, &script, &dir, |_default| Ok("custom".to_string()))
+                .unwrap();
+        assert_eq!(
+            result,
+            vec![("custom".to_string(), dir.join("payload.json"))]
+        );
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_falls_back_to_default_on_blank_name() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::write(dir.join("payload.json"), "{}").unwrap();
+
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            extra_args: vec!["--select=payload".to_string()],
+        };
+        let result =
+            bind_inputs_via_picker(&config, &script, &dir, |_default| Ok("   ".to_string()))
+                .unwrap();
+        assert_eq!(
+            result,
+            vec![("payload".to_string(), dir.join("payload.json"))]
+        );
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_returns_empty_when_nothing_selected() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "x").unwrap();
+
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            ..Default::default()
+        };
+        let result =
+            bind_inputs_via_picker(&config, &script, &dir, |default| Ok(default.to_string()))
+                .unwrap();
+        assert_eq!(result, Vec::new());
     }
 }
