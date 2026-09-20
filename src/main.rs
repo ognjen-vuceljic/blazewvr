@@ -22,6 +22,14 @@ mod watch;
 #[derive(Parser)]
 #[command(name = "blazewvr", version)]
 struct Cli {
+    /// Script to open in the TUI playground (bare invocation only; omit
+    /// to open with a placeholder until one is picked)
+    script: Option<String>,
+    #[arg(short, long)]
+    input: Vec<String>,
+    /// Module resolution path(s), e.g. --path=dir1:dir2
+    #[arg(long)]
+    path: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -388,28 +396,156 @@ fn run_history() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bare `blazewvr` (no subcommand): the TUI playground. Currently a
-/// static skeleton (Wave 4 issue #3) — renders the three panes once and
-/// exits on any keypress. Live reload, tabbed inputs, and picker/history
-/// integration land in later Wave 4 PRs. Not unit-testable (it owns the
-/// real terminal); `tui::layout`/`tui::render` carry the tested logic.
-fn run_playground() -> anyhow::Result<()> {
-    let mut terminal = ratatui::init();
-    let state = tui::PlaygroundState {
-        script: "%dw 2.0\noutput application/json\n---\n{}",
-        input_label: "no input bound (use -i data.json to bind `payload`)",
-        input_text: "",
-        output_text: "",
-    };
+/// The placeholder content shown until a script is picked (bare
+/// `blazewvr`, no script, no subcommand).
+fn static_playground_state() -> tui::PlaygroundState {
+    tui::PlaygroundState {
+        script_spans: dwl_highlight::tokenize("%dw 2.0\noutput application/json\n---\n{}"),
+        input_label: "no input bound (use -i data.json to bind `payload`)".to_string(),
+        input_spans: Vec::new(),
+        output_spans: Vec::new(),
+    }
+}
+
+/// Renders the static placeholder once and exits on any keypress.
+/// Picker integration lands in a later Wave 4 PR (issue #6) — for now
+/// this is the only bare-with-no-script behavior.
+fn run_playground_static() -> anyhow::Result<()> {
+    let mut terminal = ratatui::try_init()?;
+    let state = static_playground_state();
     terminal.draw(|frame| tui::render(frame, &state))?;
     crossterm::event::read()?;
     ratatui::restore();
     Ok(())
 }
 
+/// The bound input's display label + highlighted spans of its raw file
+/// contents, or a placeholder if none is bound. Only the first bound
+/// input is shown — tabbed multi-input lands in a later Wave 4 PR.
+fn playground_input_display(inputs: &[(String, PathBuf)]) -> (String, Vec<span::StyledSpan>) {
+    match inputs.first() {
+        Some((name, file)) => {
+            let text = std::fs::read_to_string(file)
+                .unwrap_or_else(|e| format!("error reading {}: {e}", file.display()));
+            (name.clone(), colorize::tokenize(&text))
+        }
+        None => (
+            "no input bound (use -i data.json to bind `payload`)".to_string(),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Re-reads the script, re-evaluates it against `target`'s bound inputs,
+/// and builds the highlighted `PlaygroundState` to render for this tick.
+/// Pulled out of the render loop (which owns the real terminal/crossterm
+/// input, not itself practical to unit test) so this eval + highlighting
+/// logic is directly testable against a fake `dw`-shaped script.
+fn build_playground_state(
+    sup: &mut repl::Supervisor,
+    target: &watch::WatchTarget,
+) -> tui::PlaygroundState {
+    let script_src = std::fs::read_to_string(&target.script).unwrap_or_default();
+    let (input_label, input_spans) = playground_input_display(&target.inputs);
+    let output_spans = match sup.eval(&flatten::flatten(&script_src)) {
+        Ok(text) => colorize::tokenize(&text),
+        Err(err) => dwl_highlight::tokenize(&format!("error: {err}")),
+    };
+    tui::PlaygroundState {
+        script_spans: dwl_highlight::tokenize(&script_src),
+        input_label,
+        input_spans,
+        output_spans,
+    }
+}
+
+/// The live-reload loop's branching: quit on `q`/Esc, re-evaluate on a
+/// watched-file change, otherwise keep looping — same 300ms poll cadence
+/// as `watch`. `draw`/`poll_key` are injected (rather than owning a real
+/// terminal/crossterm input directly) so this is testable with fakes;
+/// `run_playground_live_loop` is the thin real-IO adapter around it.
+fn run_playground_ticks(
+    sup: &mut repl::Supervisor,
+    target: &watch::WatchTarget,
+    mut draw: impl FnMut(&tui::PlaygroundState) -> anyhow::Result<()>,
+    mut poll_key: impl FnMut(Duration) -> anyhow::Result<Option<crossterm::event::KeyCode>>,
+) -> anyhow::Result<()> {
+    let paths = watch::watched_paths(target);
+    let mut last = watch::mtimes(&paths);
+    let mut state = build_playground_state(sup, target);
+
+    loop {
+        draw(&state)?;
+
+        match poll_key(Duration::from_millis(300))? {
+            Some(crossterm::event::KeyCode::Char('q')) | Some(crossterm::event::KeyCode::Esc) => {
+                return Ok(());
+            }
+            Some(_) => continue,
+            None => {
+                let current = watch::mtimes(&paths);
+                if current != last {
+                    last = current;
+                    state = build_playground_state(sup, target);
+                }
+            }
+        }
+    }
+}
+
+/// Not unit-testable (owns the real terminal + crossterm input); see
+/// `run_playground_ticks` for the tested branching logic this wraps.
+fn run_playground_live_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    sup: &mut repl::Supervisor,
+    target: &watch::WatchTarget,
+) -> anyhow::Result<()> {
+    run_playground_ticks(
+        sup,
+        target,
+        |state| {
+            terminal.draw(|frame| tui::render(frame, state))?;
+            Ok(())
+        },
+        |timeout| {
+            if crossterm::event::poll(timeout)?
+                && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+            {
+                return Ok(Some(key.code));
+            }
+            Ok(None)
+        },
+    )
+}
+
+/// Bare `blazewvr script.dwl`: opens the TUI playground live-reloading
+/// that script, same input resolution (CLI > sidecar > config) as `run`.
+fn run_playground_live(
+    script: String,
+    input: Vec<String>,
+    path: Option<String>,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let plan = prepare_run(&cwd, &script, input, path)?;
+    let target = watch::WatchTarget {
+        script: PathBuf::from(&script),
+        inputs: plan.inputs.clone(),
+    };
+    let mut sup = repl::Supervisor::new(build_repl_config(&plan.inputs, &plan.module_path));
+
+    let mut terminal = ratatui::try_init()?;
+    let result = run_playground_live_loop(&mut terminal, &mut sup, &target);
+    ratatui::restore();
+    result
+}
+
 fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
-        None => run_playground(),
+    let cli = Cli::parse();
+    match cli.command {
+        None => match cli.script {
+            Some(script) => run_playground_live(script, cli.input, cli.path),
+            None => run_playground_static(),
+        },
         Some(Commands::Run {
             script,
             input,
@@ -890,5 +1026,212 @@ mod tests {
             }
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn cli_parses_bare_script_with_no_subcommand() {
+        let cli = Cli::parse_from(["blazewvr", "script.dwl", "-i", "a.json"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.script, Some("script.dwl".to_string()));
+        assert_eq!(cli.input, vec!["a.json".to_string()]);
+    }
+
+    fn spans_text(spans: &[span::StyledSpan]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn static_playground_state_shows_a_placeholder_dwl_script_and_no_input() {
+        let state = static_playground_state();
+        assert!(spans_text(&state.script_spans).contains("%dw 2.0"));
+        assert!(state.input_label.contains("no input bound"));
+        assert!(state.input_spans.is_empty());
+        assert!(state.output_spans.is_empty());
+    }
+
+    #[test]
+    fn playground_input_display_shows_placeholder_when_no_inputs_bound() {
+        let (label, spans) = playground_input_display(&[]);
+        assert!(label.contains("no input bound"));
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn playground_input_display_reads_and_labels_the_first_bound_input() {
+        let dir = test_dir();
+        let file = dir.join("payload.json");
+        fs::write(&file, r#"{"a": 1}"#).unwrap();
+        let (label, spans) = playground_input_display(&[("payload".to_string(), file)]);
+        assert_eq!(label, "payload");
+        assert_eq!(spans_text(&spans), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn playground_input_display_reports_a_read_error_inline() {
+        let missing = test_dir().join("missing.json");
+        let (label, spans) = playground_input_display(&[("payload".to_string(), missing)]);
+        assert_eq!(label, "payload");
+        assert!(spans_text(&spans).contains("error reading"));
+    }
+
+    #[test]
+    fn build_playground_state_reflects_current_script_and_output() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "hello").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let state = build_playground_state(&mut sup, &target);
+
+        assert_eq!(spans_text(&state.script_spans), "hello");
+        assert!(spans_text(&state.output_spans).contains("ECHO:hello"));
+        assert!(state.input_label.contains("no input bound"));
+    }
+
+    #[test]
+    fn build_playground_state_highlights_eval_errors() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "boom").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config_that_errors());
+
+        let state = build_playground_state(&mut sup, &target);
+
+        assert!(spans_text(&state.output_spans).contains("error"));
+    }
+
+    #[test]
+    fn run_playground_ticks_quits_on_q() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let mut draws = 0;
+        let mut calls = 0;
+        let result = run_playground_ticks(
+            &mut sup,
+            &target,
+            |_state| {
+                draws += 1;
+                Ok(())
+            },
+            |_timeout| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(crossterm::event::KeyCode::Char('q')))
+                }
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(draws, 2);
+    }
+
+    #[test]
+    fn run_playground_ticks_quits_on_esc() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let result = run_playground_ticks(
+            &mut sup,
+            &target,
+            |_state| Ok(()),
+            |_timeout| Ok(Some(crossterm::event::KeyCode::Esc)),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_playground_ticks_ignores_non_quit_keys_and_keeps_looping() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let target = watch::WatchTarget {
+            script,
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let mut draws = 0;
+        let mut calls = 0;
+        run_playground_ticks(
+            &mut sup,
+            &target,
+            |_state| {
+                draws += 1;
+                Ok(())
+            },
+            |_timeout| {
+                calls += 1;
+                if calls < 3 {
+                    Ok(Some(crossterm::event::KeyCode::Char('x')))
+                } else {
+                    Ok(Some(crossterm::event::KeyCode::Char('q')))
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(draws, 3);
+    }
+
+    #[test]
+    fn run_playground_ticks_reevaluates_on_a_watched_file_change() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "one").unwrap();
+        let target = watch::WatchTarget {
+            script: script.clone(),
+            inputs: vec![],
+        };
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+
+        let mut outputs: Vec<String> = Vec::new();
+        let mut calls = 0;
+        run_playground_ticks(
+            &mut sup,
+            &target,
+            |state| {
+                outputs.push(spans_text(&state.output_spans));
+                Ok(())
+            },
+            |_timeout| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        fs::write(&script, "two").unwrap();
+                        Ok(None)
+                    }
+                    _ => Ok(Some(crossterm::event::KeyCode::Esc)),
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(outputs[0].contains("ECHO:one"));
+        assert!(outputs.last().unwrap().contains("ECHO:two"));
     }
 }
