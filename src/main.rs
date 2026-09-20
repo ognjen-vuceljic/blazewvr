@@ -7,6 +7,7 @@ mod colorize;
 mod config;
 mod dwl_highlight;
 mod flatten;
+mod history;
 mod picker;
 mod repl;
 mod run_once;
