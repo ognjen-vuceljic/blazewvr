@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod colorize;
+mod config;
 mod flatten;
 mod repl;
 mod run_once;
