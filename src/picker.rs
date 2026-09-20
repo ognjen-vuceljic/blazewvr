@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// Which picker binary to invoke.
 pub struct PickerConfig {
@@ -64,6 +64,20 @@ pub fn is_available(program: &Path) -> bool {
     false
 }
 
+/// Runs `attempt`, retrying once on failure.
+///
+/// The same transient-spawn-failure class documented on `is_available`
+/// above (a freshly-written, freshly-chmod'd script spuriously failing to
+/// execute) was observed hitting the *actual* picker spawn too — i.e. a
+/// real `pick`/`pick_multi`/`pick_history` call, not just the
+/// `is_available` probe that precedes it. Retrying there didn't help,
+/// since the failure showed up moments later in this separate spawn.
+/// Takes a closure rather than `&mut Command` directly so the retry
+/// itself is testable with a deterministic fail-then-succeed stub.
+fn spawn_retrying(mut attempt: impl FnMut() -> io::Result<Child>) -> io::Result<Child> {
+    attempt().or_else(|_| attempt())
+}
+
 /// Spawns the picker with `extra_flags` appended before `config`'s own
 /// `extra_args`, feeds it `candidates` on stdin, and returns its raw
 /// stdout text.
@@ -85,7 +99,8 @@ fn run_picker(
     cmd.args(extra_flags);
     #[cfg(test)]
     cmd.args(&config.extra_args);
-    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = spawn_retrying(|| cmd.spawn())?;
     let mut stdin = child
         .stdin
         .take()
@@ -317,6 +332,49 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blazewvr_picker_{}_{id}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test dir");
         dir
+    }
+
+    #[test]
+    fn spawn_retrying_succeeds_immediately_when_first_attempt_works() {
+        let mut attempts = 0;
+        let result = spawn_retrying(|| {
+            attempts += 1;
+            Command::new(fake_fzf_script()).spawn()
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            attempts, 1,
+            "should not retry when the first attempt succeeds"
+        );
+    }
+
+    #[test]
+    fn spawn_retrying_propagates_error_when_both_attempts_fail() {
+        let mut attempts = 0;
+        let result = spawn_retrying(|| {
+            attempts += 1;
+            Command::new("/nonexistent/blazewvr/nope").spawn()
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn spawn_retrying_succeeds_on_second_attempt_after_a_transient_failure() {
+        // Reproduces the observed CI failure shape: the first spawn of a
+        // given command fails, but the exact same command succeeds
+        // moments later.
+        let mut attempts = 0;
+        let result = spawn_retrying(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::other("transient spawn failure"))
+            } else {
+                Command::new(fake_fzf_script()).spawn()
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
     }
 
     /// Fake fzf: reads candidates from stdin, prints the ones matching a
