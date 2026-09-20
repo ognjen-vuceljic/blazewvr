@@ -98,11 +98,17 @@ fn validate_subcommand_prints_stub() {
 
 #[test]
 fn bare_invocation_fails_cleanly_without_a_real_terminal() {
-    // `run`'s stdout/stderr are pipes, not a tty, so the TUI can't
-    // acquire a terminal — this must be a clean `Err` (not a panic; see
-    // the ratatui::try_init switch) with a decodable, human-readable
-    // message on stderr.
-    let output = run(&[]);
+    // No script given means bare invocation fuzzy-picks one via `fzf`
+    // first (Wave 4 issue #6) — before ever touching the TUI. PATH is
+    // cleared so this deterministically hits "fzf not found" instead of
+    // possibly launching a real, genuinely-interactive `fzf` if one
+    // happens to be installed on the machine running this test (which
+    // would hang waiting for a real tty that these pipes don't provide).
+    let output = Command::new(env!("CARGO_BIN_EXE_blazewvr"))
+        .env("PATH", "")
+        .stdin(Stdio::null())
+        .output()
+        .expect("binary should run");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!stderr.to_lowercase().contains("panicked"));
