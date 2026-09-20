@@ -163,7 +163,7 @@ pub fn pick_multi(config: &PickerConfig, candidates: &[String]) -> io::Result<Ve
         .collect())
 }
 
-const DATA_EXTENSIONS: &[&str] = &["json", "xml", "csv", "yaml", "yml", "txt"];
+pub(crate) const DATA_EXTENSIONS: &[&str] = &["json", "xml", "csv", "yaml", "yml", "txt"];
 
 /// Recursively finds `.dwl` files under `root`. See `find_files` for the
 /// shared traversal rules (symlinks, hidden dirs, `target/`, unreadable
