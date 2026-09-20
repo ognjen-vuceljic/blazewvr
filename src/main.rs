@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod colorize;
 mod config;
+mod dwl_highlight;
 mod flatten;
 mod repl;
 mod run_once;
