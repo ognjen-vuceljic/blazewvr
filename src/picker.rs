@@ -46,13 +46,28 @@ impl Default for PickerConfig {
 
 /// True if `program` can be executed at all (used to check `fzf` is on
 /// `PATH` before relying on it).
+///
+/// Retries once on failure. Observed twice in real CI runs (not
+/// reproducible locally, in either build): a freshly-written,
+/// freshly-chmod'd script spawned via this exact call spuriously failed
+/// to execute, while every other spawn (including the same script, via
+/// `pick`/`pick_multi`, moments later in the same test) succeeded. A
+/// single retry is cheap — this only runs once per command invocation —
+/// and turns a transient spawn hiccup into a non-issue rather than a
+/// wrongly-reported "fzf not found".
 pub fn is_available(program: &Path) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+    for _ in 0..2 {
+        let ok = Command::new(program)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Spawns the picker with `extra_flags` appended before `config`'s own
