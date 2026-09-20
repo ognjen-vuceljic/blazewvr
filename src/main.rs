@@ -15,6 +15,7 @@ mod run_once;
 mod sidecar;
 mod span;
 mod status;
+mod tui;
 mod watch;
 
 /// blazewvr — fast local playground for DataWeave scripts
@@ -22,7 +23,7 @@ mod watch;
 #[command(name = "blazewvr", version)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -387,22 +388,42 @@ fn run_history() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Bare `blazewvr` (no subcommand): the TUI playground. Currently a
+/// static skeleton (Wave 4 issue #3) — renders the three panes once and
+/// exits on any keypress. Live reload, tabbed inputs, and picker/history
+/// integration land in later Wave 4 PRs. Not unit-testable (it owns the
+/// real terminal); `tui::layout`/`tui::render` carry the tested logic.
+fn run_playground() -> anyhow::Result<()> {
+    let mut terminal = ratatui::init();
+    let state = tui::PlaygroundState {
+        script: "%dw 2.0\noutput application/json\n---\n{}",
+        input_label: "no input bound (use -i data.json to bind `payload`)",
+        input_text: "",
+        output_text: "",
+    };
+    terminal.draw(|frame| tui::render(frame, &state))?;
+    crossterm::event::read()?;
+    ratatui::restore();
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Commands::Run {
+        None => run_playground(),
+        Some(Commands::Run {
             script,
             input,
             path,
-        } => run_run(script, input, path),
-        Commands::Repl { input, path } => run_repl(input, path),
-        Commands::Watch {
+        }) => run_run(script, input, path),
+        Some(Commands::Repl { input, path }) => run_repl(input, path),
+        Some(Commands::Watch {
             script,
             input,
             path,
             pick_inputs,
-        } => run_watch(script, input, path, pick_inputs),
-        Commands::History => run_history(),
-        other => {
+        }) => run_watch(script, input, path, pick_inputs),
+        Some(Commands::History) => run_history(),
+        Some(other) => {
             println!("{}", dispatch(other));
             Ok(())
         }
@@ -739,7 +760,7 @@ mod tests {
     fn cli_parses_path_flag() {
         let cli = Cli::parse_from(["blazewvr", "run", "s.dwl", "--path", "a:b"]);
         match cli.command {
-            Commands::Run { path, .. } => assert_eq!(path, Some("a:b".to_string())),
+            Some(Commands::Run { path, .. }) => assert_eq!(path, Some("a:b".to_string())),
             _ => panic!("expected Run"),
         }
     }
@@ -767,7 +788,7 @@ mod tests {
     fn cli_parses_watch_subcommand() {
         let cli = Cli::parse_from(["blazewvr", "watch", "s.dwl", "-i", "a=b.json"]);
         match cli.command {
-            Commands::Watch { script, input, .. } => {
+            Some(Commands::Watch { script, input, .. }) => {
                 assert_eq!(script, Some("s.dwl".to_string()));
                 assert_eq!(input, vec!["a=b.json".to_string()]);
             }
@@ -779,7 +800,7 @@ mod tests {
     fn cli_parses_watch_without_script() {
         let cli = Cli::parse_from(["blazewvr", "watch"]);
         match cli.command {
-            Commands::Watch { script, .. } => assert_eq!(script, None),
+            Some(Commands::Watch { script, .. }) => assert_eq!(script, None),
             _ => panic!("expected Watch"),
         }
     }
@@ -788,7 +809,7 @@ mod tests {
     fn cli_parses_watch_pick_inputs_flag() {
         let cli = Cli::parse_from(["blazewvr", "watch", "s.dwl", "--pick-inputs"]);
         match cli.command {
-            Commands::Watch { pick_inputs, .. } => assert!(pick_inputs),
+            Some(Commands::Watch { pick_inputs, .. }) => assert!(pick_inputs),
             _ => panic!("expected Watch"),
         }
     }
@@ -796,14 +817,20 @@ mod tests {
     #[test]
     fn cli_parses_history_subcommand() {
         let cli = Cli::parse_from(["blazewvr", "history"]);
-        assert!(matches!(cli.command, Commands::History));
+        assert!(matches!(cli.command, Some(Commands::History)));
+    }
+
+    #[test]
+    fn cli_parses_bare_invocation_as_no_command() {
+        let cli = Cli::parse_from(["blazewvr"]);
+        assert!(cli.command.is_none());
     }
 
     #[test]
     fn cli_parses_repl_input_flag() {
         let cli = Cli::parse_from(["blazewvr", "repl", "-i", "payload=data.json"]);
         match cli.command {
-            Commands::Repl { input, .. } => {
+            Some(Commands::Repl { input, .. }) => {
                 assert_eq!(input, vec!["payload=data.json".to_string()])
             }
             _ => panic!("expected Repl"),
@@ -857,7 +884,7 @@ mod tests {
     fn cli_parses_run_subcommand() {
         let cli = Cli::parse_from(["blazewvr", "run", "script.dwl", "-i", "a.json"]);
         match cli.command {
-            Commands::Run { script, input, .. } => {
+            Some(Commands::Run { script, input, .. }) => {
                 assert_eq!(script, "script.dwl");
                 assert_eq!(input, vec!["a.json".to_string()]);
             }
