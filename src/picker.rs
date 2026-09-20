@@ -16,18 +16,30 @@ use std::process::{Command, Stdio};
 /// Which picker binary to invoke.
 pub struct PickerConfig {
     pub program: PathBuf,
-    /// Extra args appended to every invocation. Empty for real `fzf`
-    /// usage; tests use this to make the fake picker script deterministic
-    /// without resorting to process-global env vars (which would race
-    /// under parallel test execution).
+    /// Extra args appended to every invocation, to make the fake picker
+    /// script deterministic in tests without resorting to process-global
+    /// env vars (which would race under parallel test execution).
+    /// `#[cfg(test)]`-gated (rather than just documented as test-only) so
+    /// it cannot exist as a field on the type real callers construct,
+    /// ruling out any future mix-up with `run_picker`'s own internal
+    /// `extra_flags` mechanism (used for `-m`).
+    #[cfg(test)]
     pub extra_args: Vec<String>,
 }
 
 impl Default for PickerConfig {
+    #[cfg(test)]
     fn default() -> Self {
         Self {
             program: PathBuf::from("fzf"),
             extra_args: Vec::new(),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("fzf"),
         }
     }
 }
@@ -43,7 +55,7 @@ pub fn is_available(program: &Path) -> bool {
         .is_ok()
 }
 
-/// Spawns the picker with `extra_flags` appended after `config`'s own
+/// Spawns the picker with `extra_flags` appended before `config`'s own
 /// `extra_args`, feeds it `candidates` on stdin, and returns its raw
 /// stdout text.
 ///
@@ -60,12 +72,11 @@ fn run_picker(
     extra_flags: &[&str],
     candidates: &[String],
 ) -> io::Result<String> {
-    let mut child = Command::new(&config.program)
-        .args(extra_flags)
-        .args(&config.extra_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let mut cmd = Command::new(&config.program);
+    cmd.args(extra_flags);
+    #[cfg(test)]
+    cmd.args(&config.extra_args);
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     let mut stdin = child
         .stdin
         .take()
@@ -120,15 +131,17 @@ pub fn find_dwl_scripts(root: &Path) -> Vec<PathBuf> {
     })
 }
 
-/// Recursively finds likely data files (json/xml/csv/yaml/txt) under
-/// `root`, excluding `exclude` (typically the script being run — it
-/// wouldn't make sense to bind it as its own input).
+/// Recursively finds likely data files (json/xml/csv/yaml/txt, matched
+/// case-insensitively so e.g. `payload.JSON` from a Windows tool or a
+/// manual rename isn't silently invisible) under `root`, excluding
+/// `exclude` (typically the script being run — it wouldn't make sense to
+/// bind it as its own input).
 pub fn find_data_files(root: &Path, exclude: &Path) -> Vec<PathBuf> {
     find_files(root, |p| {
         p != exclude
             && p.extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|ext| DATA_EXTENSIONS.contains(&ext))
+                .is_some_and(|ext| DATA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
     })
 }
 
@@ -175,16 +188,30 @@ fn walk(dir: &Path, results: &mut Vec<PathBuf>, matches: &impl Fn(&Path) -> bool
     }
 }
 
+/// Builds the candidate strings to feed the picker plus a lookup from
+/// each one back to its original `PathBuf`, built once so callers with
+/// multiple selections (`bind_inputs_via_picker`) don't re-stringify
+/// every candidate per selection.
+///
+/// Matching a selection back to its `PathBuf` this way (rather than by
+/// re-parsing the picker's text output into a path) matters because
+/// candidates are sent through `path.display()`, which is lossy for
+/// non-UTF-8 filenames — re-parsing would silently produce a different,
+/// nonexistent path for any such name.
+fn candidate_index(paths: &[PathBuf]) -> (Vec<String>, std::collections::HashMap<String, PathBuf>) {
+    let mut strs = Vec::with_capacity(paths.len());
+    let mut by_display = std::collections::HashMap::with_capacity(paths.len());
+    for p in paths {
+        let s = p.display().to_string();
+        strs.push(s.clone());
+        by_display.insert(s, p.clone());
+    }
+    (strs, by_display)
+}
+
 /// Finds `.dwl` scripts under `root` and lets the user fuzzy-pick one.
 /// Errs clearly if `fzf` isn't available, rather than silently doing
 /// nothing.
-///
-/// Candidates are matched back to their original `PathBuf` by an exact
-/// lookup on the same (possibly lossy, for non-UTF-8 names) display
-/// string sent to the picker, rather than by re-parsing the picker's
-/// text output into a path — the latter would silently produce a
-/// different, nonexistent path for any filename containing invalid
-/// UTF-8, since the lossy substitution isn't reversible.
 pub fn pick_script(config: &PickerConfig, root: &Path) -> io::Result<Option<PathBuf>> {
     if !is_available(&config.program) {
         return Err(io::Error::new(
@@ -196,13 +223,9 @@ pub fn pick_script(config: &PickerConfig, root: &Path) -> io::Result<Option<Path
         ));
     }
 
-    let scripts = find_dwl_scripts(root);
-    let candidates: Vec<String> = scripts.iter().map(|p| p.display().to_string()).collect();
-
+    let (candidates, by_display) = candidate_index(&find_dwl_scripts(root));
     match pick(config, &candidates)? {
-        Some(selected) => Ok(scripts
-            .into_iter()
-            .find(|p| p.display().to_string() == selected)),
+        Some(selected) => Ok(by_display.get(&selected).cloned()),
         None => Ok(None),
     }
 }
@@ -214,6 +237,13 @@ pub fn pick_script(config: &PickerConfig, root: &Path) -> io::Result<Option<Path
 /// to the default). Injectable so the real "prompt the user on stdin"
 /// behavior and the fully-scripted test behavior share this same
 /// resolution logic.
+///
+/// If two selected files would otherwise bind to the same name (e.g.
+/// `sub_a/payload.json` and `sub_b/payload.csv` both default-naming to
+/// "payload"), later collisions get a numeric suffix (`payload_2`) so
+/// one binding doesn't silently shadow another — this only disambiguates
+/// the common case of repeated collisions on the same base name, not
+/// every possible pathological naming scheme.
 pub fn bind_inputs_via_picker(
     config: &PickerConfig,
     script: &Path,
@@ -230,16 +260,14 @@ pub fn bind_inputs_via_picker(
         ));
     }
 
-    let candidates = find_data_files(root, script);
-    let candidate_strs: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+    let (candidate_strs, by_display) = candidate_index(&find_data_files(root, script));
     let selected = pick_multi(config, &candidate_strs)?;
 
     let mut bound = Vec::new();
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for selection in selected {
-        let Some(path) = candidates
-            .iter()
-            .find(|p| p.display().to_string() == selection)
-        else {
+        let Some(path) = by_display.get(&selection) else {
             continue;
         };
         let default_name = path
@@ -248,11 +276,20 @@ pub fn bind_inputs_via_picker(
             .unwrap_or("input")
             .to_string();
         let name = name_for(&default_name)?;
-        let name = if name.trim().is_empty() {
+        let base_name = if name.trim().is_empty() {
             default_name
         } else {
             name.trim().to_string()
         };
+
+        let count = name_counts.entry(base_name.clone()).or_insert(0);
+        *count += 1;
+        let name = if *count > 1 {
+            format!("{base_name}_{count}")
+        } else {
+            base_name
+        };
+
         bound.push((name, path.clone()));
     }
     Ok(bound)
@@ -510,6 +547,54 @@ fi
         assert_eq!(
             found,
             vec![dir.join("headers.xml"), dir.join("payload.json")]
+        );
+    }
+
+    #[test]
+    fn find_data_files_matches_extensions_case_insensitively() {
+        let dir = test_dir();
+        let script = dir.join("script.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::write(dir.join("payload.JSON"), "{}").unwrap();
+        fs::write(dir.join("export.Csv"), "a,b").unwrap();
+
+        let found = find_data_files(&dir, &script);
+        assert_eq!(
+            found,
+            vec![dir.join("export.Csv"), dir.join("payload.JSON")]
+        );
+    }
+
+    #[test]
+    fn bind_inputs_via_picker_disambiguates_colliding_default_names() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "x").unwrap();
+        fs::create_dir_all(dir.join("sub_a")).unwrap();
+        fs::create_dir_all(dir.join("sub_b")).unwrap();
+        fs::write(dir.join("sub_a/payload.json"), "{}").unwrap();
+        fs::write(dir.join("sub_b/payload.csv"), "a").unwrap();
+
+        // Both files default-name to "payload"; select both via a
+        // substring common to both paths.
+        let config = PickerConfig {
+            program: fake_fzf_script(),
+            extra_args: vec!["--select=payload".to_string()],
+        };
+        let mut result =
+            bind_inputs_via_picker(&config, &script, &dir, |default| Ok(default.to_string()))
+                .unwrap();
+        result.sort();
+
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names.len(), 2, "expected two bound inputs, got {names:?}");
+        assert!(
+            names.contains(&"payload"),
+            "first collision keeps the base name: {names:?}"
+        );
+        assert!(
+            names.contains(&"payload_2"),
+            "second collision gets a numeric suffix: {names:?}"
         );
     }
 
