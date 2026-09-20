@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
+mod flatten;
+
 /// blazewvr — fast local playground for DataWeave scripts
 #[derive(Parser)]
 #[command(name = "blazewvr", version)]
