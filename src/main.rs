@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 mod flatten;
+mod repl;
 
 /// blazewvr — fast local playground for DataWeave scripts
 #[derive(Parser)]
