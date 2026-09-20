@@ -61,8 +61,19 @@ fn repl_subcommand_shows_bound_inputs_in_the_banner() {
 }
 
 #[test]
+fn repl_subcommand_defaults_a_bare_input_path_to_payload() {
+    // Matches the DataWeave Playground convention: `payload` is the
+    // default name for the incoming input, so a bare file (no `name=`
+    // prefix) should bind as `payload` without the user needing to know
+    // or type that prefix.
+    let output = run(&["repl", "-i", "data.json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("payload=data.json"));
+}
+
+#[test]
 fn repl_subcommand_fails_clearly_on_invalid_input_format() {
-    let output = run(&["repl", "-i", "bad-input"]);
+    let output = run(&["repl", "-i", "=bad-input"]);
     assert!(!output.status.success());
 }
 

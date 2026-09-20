@@ -37,7 +37,8 @@ enum Commands {
     },
     /// Interactive read-eval-print loop
     Repl {
-        /// Bind an input for expressions to reference, e.g. -i payload=data.json
+        /// Bind an input for expressions to reference, e.g. -i data.json
+        /// (defaults to `payload`) or -i name=file for another name
         #[arg(short, long)]
         input: Vec<String>,
         /// Module resolution path(s), e.g. --path=dir1:dir2
@@ -177,7 +178,7 @@ fn run_repl(input: Vec<String>, path: Option<String>) -> anyhow::Result<()> {
 
     if inputs.is_empty() {
         println!(
-            "blazewvr REPL — no inputs bound (use -i name=file), type a DataWeave expression, Ctrl+D to exit"
+            "blazewvr REPL — no inputs bound (use -i data.json to bind `payload`), type a DataWeave expression, Ctrl+D to exit"
         );
     } else {
         let bound = inputs
@@ -588,7 +589,7 @@ mod tests {
         let result = prepare_watch(
             &dir,
             Some("s.dwl".into()),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
             false,
             &picker_config,
@@ -669,7 +670,7 @@ mod tests {
         let result = prepare_run(
             &dir,
             &script.display().to_string(),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
         );
         assert!(result.is_err());
@@ -754,7 +755,7 @@ mod tests {
     fn run_watch_rejects_invalid_input_format() {
         let result = run_watch(
             Some("script.dwl".into()),
-            vec!["bad-input".into()],
+            vec!["=bad-input".into()],
             None,
             false,
         );
@@ -810,7 +811,7 @@ mod tests {
 
     #[test]
     fn run_repl_rejects_invalid_input_format() {
-        let result = run_repl(vec!["bad-input".into()], None);
+        let result = run_repl(vec!["=bad-input".into()], None);
         assert!(result.is_err());
     }
 
