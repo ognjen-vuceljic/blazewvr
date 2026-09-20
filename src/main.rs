@@ -6,6 +6,7 @@ use std::time::Duration;
 mod colorize;
 mod flatten;
 mod repl;
+mod sidecar;
 mod status;
 mod watch;
 
