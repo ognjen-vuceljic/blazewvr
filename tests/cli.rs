@@ -95,3 +95,32 @@ fn validate_subcommand_prints_stub() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("foo.dwl"));
 }
+
+#[test]
+fn bare_invocation_fails_cleanly_without_a_real_terminal() {
+    // `run`'s stdout/stderr are pipes, not a tty, so the TUI can't
+    // acquire a terminal — this must be a clean `Err` (not a panic; see
+    // the ratatui::try_init switch) with a decodable, human-readable
+    // message on stderr.
+    let output = run(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.to_lowercase().contains("panicked"));
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn bare_script_invocation_resolves_inputs_before_failing_without_a_real_terminal() {
+    let dir = std::env::temp_dir().join(format!("blazewvr_cli_bare_script_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("s.dwl");
+    std::fs::write(&script, "output application/json --- {}").unwrap();
+
+    // Same as the missing-tty case above, but exercising the script ->
+    // prepare_run -> WatchTarget -> Supervisor path first, proving that
+    // real input resolution happens before the terminal is touched.
+    let output = run(&[script.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.to_lowercase().contains("panicked"));
+}

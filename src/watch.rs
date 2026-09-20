@@ -36,14 +36,17 @@ pub fn parse_input(s: &str) -> Result<(String, PathBuf), String> {
 }
 
 /// All paths whose modification time should be polled for `target`.
-fn watched_paths(target: &WatchTarget) -> Vec<PathBuf> {
+///
+/// `pub(crate)`: the TUI's live-reload loop polls the same paths as
+/// `run_loop`, so it reuses this instead of re-deriving the list.
+pub(crate) fn watched_paths(target: &WatchTarget) -> Vec<PathBuf> {
     let mut paths = vec![target.script.clone()];
     paths.extend(target.inputs.iter().map(|(_, file)| file.clone()));
     paths
 }
 
 /// Modification times for `paths`, `None` for any that can't be stat'd.
-fn mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
+pub(crate) fn mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
     paths
         .iter()
         .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
