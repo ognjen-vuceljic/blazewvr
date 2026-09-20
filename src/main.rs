@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,26 +63,126 @@ enum Commands {
 /// Renders the (currently stubbed) response for a parsed command.
 fn dispatch(command: Commands) -> String {
     match command {
-        Commands::Run {
-            script,
-            input,
-            path,
-        } => {
-            format!(
-                "{} {script} (inputs: {input:?}, path: {path:?})",
-                "[run] not yet implemented:".yellow()
-            )
-        }
-        Commands::Repl { path } => {
-            format!("{} (path: {path:?})", "[repl] not yet implemented".yellow())
-        }
         Commands::Validate { script } => {
             format!("{} {script}", "[validate] not yet implemented:".yellow())
         }
-        Commands::Watch { .. } | Commands::History => {
-            unreachable!("Watch/History are handled directly in main(), not dispatch()")
+        Commands::Run { .. }
+        | Commands::Repl { .. }
+        | Commands::Watch { .. }
+        | Commands::History => {
+            unreachable!("Run/Repl/Watch/History are handled directly in main(), not dispatch()")
         }
     }
+}
+
+/// The fully-resolved script source/inputs/module-path a `run` invocation
+/// will evaluate against.
+struct RunPlan {
+    src: String,
+    inputs: Vec<(String, PathBuf)>,
+    module_path: Option<String>,
+}
+
+/// Resolves everything `run_run` needs (script contents, inputs, module
+/// path — CLI > sidecar > config, same precedence as `watch`), kept free
+/// of process spawning so it's directly unit-testable.
+fn prepare_run(
+    cwd: &Path,
+    script: &str,
+    input: Vec<String>,
+    path: Option<String>,
+) -> anyhow::Result<RunPlan> {
+    let project = config::load(cwd)?;
+
+    let script_path = PathBuf::from(script);
+    let src = std::fs::read_to_string(&script_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", script_path.display()))?;
+
+    let cli_inputs: Vec<(String, PathBuf)> = input
+        .iter()
+        .map(|s| watch::parse_input(s))
+        .collect::<Result<_, _>>()
+        .map_err(anyhow::Error::msg)?;
+    let sidecar_inputs = sidecar::discover(&script_path);
+    let config_inputs = project
+        .as_ref()
+        .map(|p| p.inputs.clone())
+        .unwrap_or_default();
+    let inputs = resolve_inputs(cli_inputs, sidecar_inputs, config_inputs);
+    let module_path = resolve_module_path(path, project.and_then(|p| p.module_path));
+
+    Ok(RunPlan {
+        src,
+        inputs,
+        module_path,
+    })
+}
+
+/// The one-shot input -> script -> output flow: evaluates `script` exactly
+/// once via `dw run` and prints the result. Exits non-zero (via the
+/// returned `Err`) on a read or eval failure, unlike `watch`, since a
+/// one-shot run is the shape a script or pipeline would actually depend
+/// on the exit code for.
+fn run_run(script: String, input: Vec<String>, path: Option<String>) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let plan = prepare_run(&cwd, &script, input, path)?;
+
+    let run_config =
+        run_once::RunOnceConfig::for_dw(Path::new("dw"), &plan.inputs, plan.module_path.as_deref());
+    match run_once::eval_once(&run_config, &plan.src) {
+        Ok(text) => {
+            println!("{}", colorize::colorize(&text));
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("{}", dwl_highlight::highlight(&format!("error: {err}")));
+            anyhow::bail!("script evaluation failed")
+        }
+    }
+}
+
+/// Evaluates one line typed at the interactive REPL, returning the
+/// colorized/highlighted text to print. Pulled out of `run_repl` (which
+/// wraps this in a blocking read-a-line-from-stdin loop, not itself
+/// practical to unit test) so the eval + formatting logic is directly
+/// testable against a fake `dw`-shaped script.
+fn repl_eval_line(sup: &mut repl::Supervisor, line: &str) -> String {
+    match sup.eval(line) {
+        Ok(text) => colorize::colorize(&text),
+        Err(err) => dwl_highlight::highlight(&format!("error: {err}")),
+    }
+}
+
+/// The interactive layer: a real-time, user-driven read-eval-print loop.
+/// Each line the user types is sent straight to a persistent `dw repl`
+/// child (via `Supervisor`, so a crashed child transparently respawns)
+/// and its result is printed immediately — unlike `run` (one script,
+/// one output, exits) or `watch` (re-evaluates a file on save), this is
+/// driven by the user typing at the prompt, one expression at a time.
+fn run_repl(path: Option<String>) -> anyhow::Result<()> {
+    let mut config = repl::ReplConfig::for_dw(Path::new("dw"), &[]);
+    if let Some(p) = &path {
+        config = config.with_module_path(p);
+    }
+    let mut sup = repl::Supervisor::new(config);
+
+    println!("blazewvr REPL — type a DataWeave expression, Ctrl+D to exit");
+    let stdin = std::io::stdin();
+    loop {
+        print!("dw> ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            println!();
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        println!("{}", repl_eval_line(&mut sup, line));
+    }
+    Ok(())
 }
 
 /// CLI `--path` wins over the config file's `module_path`.
@@ -266,6 +367,12 @@ fn run_history() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
+        Commands::Run {
+            script,
+            input,
+            path,
+        } => run_run(script, input, path),
+        Commands::Repl { path } => run_repl(path),
         Commands::Watch {
             script,
             input,
@@ -311,6 +418,30 @@ mod tests {
 
     fn no_prompt(default_name: &str) -> std::io::Result<String> {
         Ok(default_name.to_string())
+    }
+
+    /// Same echo-protocol fake REPL used in repl.rs's/watch.rs's tests.
+    fn fake_repl_config() -> repl::ReplConfig {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "blazewvr_main_fake_repl_{}_{id}.sh",
+            std::process::id()
+        ));
+        let script = "#!/bin/sh\nprintf 'FAKE REPL\\n>>> '\nwhile IFS= read -r line; do\n  printf 'ECHO:%s\\n>>> ' \"$line\"\ndone\n";
+        fs::write(&path, script).expect("write fake repl script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        repl::ReplConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![path.display().to_string()],
+        }
+    }
+
+    /// A config whose program doesn't exist, so any `eval` fails.
+    fn fake_repl_config_that_errors() -> repl::ReplConfig {
+        repl::ReplConfig {
+            program: PathBuf::from("/nonexistent/blazewvr/nope"),
+            args: vec![],
+        }
     }
 
     #[test]
@@ -495,38 +626,91 @@ mod tests {
     }
 
     #[test]
-    fn run_reports_script_and_inputs() {
-        let out = dispatch(Commands::Run {
-            script: "output json --- payload".into(),
-            input: vec!["payload.json".into()],
-            path: None,
-        });
-        assert!(out.contains("output json --- payload"));
-        assert!(out.contains("payload.json"));
+    fn run_run_rejects_missing_script_file() {
+        let dir = test_dir();
+        let missing = dir.join("nope.dwl");
+        let result = run_run(missing.display().to_string(), vec![], None);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn run_reports_module_path() {
-        let out = dispatch(Commands::Run {
-            script: "payload".into(),
-            input: vec![],
-            path: Some("dir1:dir2".into()),
-        });
-        assert!(out.contains("dir1:dir2"));
+    fn prepare_run_rejects_missing_script_file() {
+        let dir = test_dir();
+        let missing = dir.join("nope.dwl");
+        let result = prepare_run(&dir, &missing.display().to_string(), vec![], None);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn repl_reports_stub() {
-        let out = dispatch(Commands::Repl { path: None });
-        assert!(out.contains("not yet implemented"));
+    fn prepare_run_rejects_invalid_input_format() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "payload").unwrap();
+        let result = prepare_run(
+            &dir,
+            &script.display().to_string(),
+            vec!["bad-input".into()],
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
-    fn repl_reports_module_path() {
-        let out = dispatch(Commands::Repl {
-            path: Some("dir1".into()),
-        });
-        assert!(out.contains("dir1"));
+    fn prepare_run_reads_script_and_resolves_sidecar_inputs() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "payload.orders").unwrap();
+        fs::write(dir.join("s.payload.json"), "{}").unwrap();
+
+        let plan = prepare_run(&dir, &script.display().to_string(), vec![], None).unwrap();
+        assert_eq!(plan.src, "payload.orders");
+        assert_eq!(
+            plan.inputs,
+            vec![("payload".to_string(), dir.join("s.payload.json"))]
+        );
+        assert_eq!(plan.module_path, None);
+    }
+
+    #[test]
+    fn prepare_run_uses_config_inputs_and_module_path_when_no_cli_overrides() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "payload").unwrap();
+        fs::write(dir.join("blazewvr.toml"), "module_path = \"libs\"\n").unwrap();
+
+        let plan = prepare_run(&dir, &script.display().to_string(), vec![], None).unwrap();
+        assert_eq!(plan.module_path, Some("libs".to_string()));
+    }
+
+    #[test]
+    fn prepare_run_cli_path_wins_over_config() {
+        let dir = test_dir();
+        let script = dir.join("s.dwl");
+        fs::write(&script, "payload").unwrap();
+        fs::write(dir.join("blazewvr.toml"), "module_path = \"libs\"\n").unwrap();
+
+        let plan = prepare_run(
+            &dir,
+            &script.display().to_string(),
+            vec![],
+            Some("cli-dir".into()),
+        )
+        .unwrap();
+        assert_eq!(plan.module_path, Some("cli-dir".to_string()));
+    }
+
+    #[test]
+    fn repl_eval_line_colorizes_successful_output() {
+        let mut sup = repl::Supervisor::new(fake_repl_config());
+        let out = colorize::strip_ansi(&repl_eval_line(&mut sup, "hello"));
+        assert!(out.contains("ECHO:hello"));
+    }
+
+    #[test]
+    fn repl_eval_line_highlights_errors() {
+        let mut sup = repl::Supervisor::new(fake_repl_config_that_errors());
+        let out = repl_eval_line(&mut sup, "boom");
+        assert!(out.contains("error"));
     }
 
     #[test]

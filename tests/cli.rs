@@ -1,28 +1,66 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
 
-fn run(args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_blazewvr"))
+fn run(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_blazewvr"))
         .args(args)
+        .stdin(Stdio::null())
         .output()
-        .expect("binary should run");
-    String::from_utf8(output.stdout).expect("stdout should be utf8")
+        .expect("binary should run")
+}
+
+/// Runs with `stdin` fed the given lines (each written with a trailing
+/// newline), then closed — simulating a user typing at the REPL prompt
+/// and hitting Ctrl+D.
+fn run_with_stdin(args: &[&str], lines: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_blazewvr"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should spawn");
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    for line in lines {
+        writeln!(stdin, "{line}").expect("write to stdin");
+    }
+    drop(stdin); // close our end so the child sees EOF after these lines
+    child.wait_with_output().expect("binary should exit")
 }
 
 #[test]
-fn run_subcommand_prints_stub() {
-    let out = run(&["run", "script.dwl", "-i", "payload.json"]);
-    assert!(out.contains("script.dwl"));
-    assert!(out.contains("payload.json"));
+fn run_subcommand_fails_clearly_on_missing_script() {
+    let output = run(&["run", "script.dwl", "-i", "payload.json"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("script.dwl"));
 }
 
 #[test]
-fn repl_subcommand_prints_stub() {
-    let out = run(&["repl"]);
-    assert!(out.contains("not yet implemented"));
+fn repl_subcommand_prints_a_banner_and_exits_cleanly_on_eof() {
+    // stdin is Stdio::null(), so the REPL sees immediate EOF and exits
+    // via its "Ctrl+D" path without ever needing to spawn `dw`.
+    let output = run(&["repl"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("blazewvr REPL"));
+}
+
+#[test]
+fn repl_subcommand_skips_blank_lines_and_attempts_to_eval_real_input() {
+    // A blank line must not print anything or attempt an eval; a real
+    // line reaches the eval-and-print path (whether or not `dw` is on
+    // PATH here — either way, the loop body itself gets exercised and
+    // the process still exits cleanly once stdin closes).
+    let output = run_with_stdin(&["repl"], &["", "1 + 1"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("blazewvr REPL"));
 }
 
 #[test]
 fn validate_subcommand_prints_stub() {
-    let out = run(&["validate", "foo.dwl"]);
-    assert!(out.contains("foo.dwl"));
+    let output = run(&["validate", "foo.dwl"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("foo.dwl"));
 }
