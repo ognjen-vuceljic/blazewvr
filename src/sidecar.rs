@@ -4,11 +4,6 @@
 //! `-i` flags (Wave 1) always take precedence when given — callers only
 //! invoke this when no inputs were passed on the command line.
 
-// ponytail: not yet wired into a command (lands with Wave 2 CLI wiring);
-// allowed dead here so this PR can ship the discovery logic standalone
-// with full test coverage.
-#![allow(dead_code)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

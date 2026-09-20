@@ -5,11 +5,6 @@
 //! `5| payload.items filter (...)`), which the generic colorizer would
 //! otherwise treat as plain punctuation rather than as code.
 
-// ponytail: not yet wired into a command (lands with Wave 3 CLI wiring,
-// applied to dw's error source snippets); allowed dead here so this PR
-// can ship the highlighter standalone with full test coverage.
-#![allow(dead_code)]
-
 use colored::Colorize;
 
 const KEYWORDS: &[&str] = &[

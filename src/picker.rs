@@ -2,12 +2,6 @@
 //! installed — callers check `is_available()` first and fall back to
 //! requiring an explicit argument with a clear error when it's missing.
 
-// ponytail: not yet wired into a command (lands with Wave 3 CLI wiring);
-// allowed dead here so this PR can ship the picker standalone with full
-// test coverage against a fake fzf-like script (fzf needs a real
-// terminal for its UI, which CI doesn't have).
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
