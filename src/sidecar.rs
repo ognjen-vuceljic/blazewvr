@@ -44,8 +44,11 @@ pub fn discover(script: &Path) -> Vec<(String, PathBuf)> {
             }
             let fname = path.file_name()?.to_str()?;
             let rest = fname.strip_prefix(&prefix)?;
-            let (name, _ext) = rest.split_once('.')?;
+            let (name, ext) = rest.split_once('.')?;
             if name.is_empty() {
+                return None;
+            }
+            if !crate::picker::DATA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
                 return None;
             }
             Some((name.to_string(), path))
@@ -157,6 +160,20 @@ mod tests {
         fs::write(&script, "x").unwrap();
         // "foo.payload" has no second '.' after the prefix, so no name/ext split
         fs::write(dir.join("foo.payload"), "{}").unwrap();
+
+        assert_eq!(discover(&script), vec![]);
+    }
+
+    #[test]
+    fn ignores_sidecar_candidate_with_a_non_data_extension() {
+        let dir = test_dir();
+        let script = dir.join("foo.dwl");
+        fs::write(&script, "x").unwrap();
+        // A backup/editor artifact matching the naming convention (e.g.
+        // from `cp foo.dwl foo.dwl.bak`) must not be silently bound as an
+        // input `dw` can't even parse — reproduces a real failure hit
+        // while recording a watch-mode demo.
+        fs::write(dir.join("foo.dwl.bak"), "not data").unwrap();
 
         assert_eq!(discover(&script), vec![]);
     }
