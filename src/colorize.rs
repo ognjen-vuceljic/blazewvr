@@ -57,7 +57,7 @@ pub fn colorize(text: &str) -> String {
 }
 
 /// Strips the ANSI escape codes `colorize` emits, for round-trip testing.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

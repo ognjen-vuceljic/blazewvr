@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod colorize;
 mod flatten;
 mod repl;
 mod status;
+mod watch;
 
 /// blazewvr — fast local playground for DataWeave scripts
 #[derive(Parser)]
@@ -33,6 +36,15 @@ enum Commands {
     },
     /// Validate a DataWeave script without running it
     Validate { script: String },
+    /// Watch a script (and its inputs) and re-evaluate on every save
+    Watch {
+        script: String,
+        #[arg(short, long)]
+        input: Vec<String>,
+        /// Module resolution path(s), e.g. --path=dir1:dir2
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 /// Renders the (currently stubbed) response for a parsed command.
@@ -54,13 +66,52 @@ fn dispatch(command: Commands) -> String {
         Commands::Validate { script } => {
             format!("{} {script}", "[validate] not yet implemented:".yellow())
         }
+        Commands::Watch { .. } => {
+            unreachable!("Watch is handled directly in main(), not dispatch()")
+        }
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    println!("{}", dispatch(cli.command));
+/// Builds the supervisor + watch target and runs the poll loop forever
+/// (until the process is killed), printing each eval's result.
+fn run_watch(script: String, input: Vec<String>, path: Option<String>) -> anyhow::Result<()> {
+    let inputs: Vec<(String, PathBuf)> = input
+        .iter()
+        .map(|s| watch::parse_input(s))
+        .collect::<Result<_, _>>()
+        .map_err(anyhow::Error::msg)?;
+
+    let mut config = repl::ReplConfig::for_dw(Path::new("dw"), &inputs);
+    if let Some(p) = &path {
+        config = config.with_module_path(p);
+    }
+
+    let target = watch::WatchTarget {
+        script: PathBuf::from(script),
+        inputs,
+    };
+    watch::run_loop(
+        repl::Supervisor::new(config),
+        &target,
+        Duration::from_millis(300),
+        |out| println!("{out}\n"),
+        || true,
+    );
     Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    match Cli::parse().command {
+        Commands::Watch {
+            script,
+            input,
+            path,
+        } => run_watch(script, input, path),
+        other => {
+            println!("{}", dispatch(other));
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +168,24 @@ mod tests {
             script: "foo.dwl".into(),
         });
         assert!(out.contains("foo.dwl"));
+    }
+
+    #[test]
+    fn run_watch_rejects_invalid_input_format() {
+        let result = run_watch("script.dwl".into(), vec!["bad-input".into()], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_parses_watch_subcommand() {
+        let cli = Cli::parse_from(["blazewvr", "watch", "s.dwl", "-i", "a=b.json"]);
+        match cli.command {
+            Commands::Watch { script, input, .. } => {
+                assert_eq!(script, "s.dwl");
+                assert_eq!(input, vec!["a=b.json".to_string()]);
+            }
+            _ => panic!("expected Watch"),
+        }
     }
 
     #[test]
