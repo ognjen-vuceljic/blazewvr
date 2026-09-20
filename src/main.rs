@@ -4,6 +4,7 @@ use colored::Colorize;
 mod colorize;
 mod flatten;
 mod repl;
+mod status;
 
 /// blazewvr — fast local playground for DataWeave scripts
 #[derive(Parser)]
