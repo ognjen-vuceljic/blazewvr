@@ -34,6 +34,12 @@ impl ReplConfig {
             args,
         }
     }
+
+    /// Appends `--path=<dir>:<dir>...` for DataWeave module resolution.
+    pub fn with_module_path(mut self, path: &str) -> Self {
+        self.args.push(format!("--path={path}"));
+        self
+    }
 }
 
 /// A single, live `dw repl` child process.
@@ -292,5 +298,11 @@ mod tests {
     fn for_dw_with_no_inputs() {
         let config = ReplConfig::for_dw(Path::new("dw"), &[]);
         assert_eq!(config.args, vec!["repl", "-s"]);
+    }
+
+    #[test]
+    fn with_module_path_appends_path_flag() {
+        let config = ReplConfig::for_dw(Path::new("dw"), &[]).with_module_path("dir1:dir2");
+        assert_eq!(config.args, vec!["repl", "-s", "--path=dir1:dir2"]);
     }
 }
